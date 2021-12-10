@@ -1,2 +1,2 @@
-# camera_lidar_fusion
-Camera LiDAR fusion for ROS
+# Camera LiDAR Fusion
+Camera LiDAR fusion for ROS.
