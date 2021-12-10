@@ -1,2 +1,2 @@
 # Camera LiDAR Fusion
-Camera LiDAR fusion for ROS.
+A ROS package for the Camera LiDAR fusion.
