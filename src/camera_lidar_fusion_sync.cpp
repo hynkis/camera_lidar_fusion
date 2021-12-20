@@ -1,4 +1,6 @@
 #include <iostream>
+#include <time.h>
+#include <ctime>
 
 #include <ros/ros.h>
 #include <std_msgs/Float32.h>
@@ -8,8 +10,8 @@
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
-#include <cv_bridge/cv_bridge.h>
 
+#include <cv_bridge/cv_bridge.h>
 #include <opencv2/highgui/highgui.hpp>
 
 #include <pcl_conversions/pcl_conversions.h>
@@ -35,7 +37,7 @@ int g = 0;
 int b = 0;
 Eigen::Matrix4f trans_center, trans_left, trans_right;
 std::vector<float> vec_center, vec_left, vec_right;
-        
+
 void ImagePointSyncCallback(const sensor_msgs::CompressedImageConstPtr& msg_img_center, const sensor_msgs::CompressedImageConstPtr& msg_img_left, const sensor_msgs::CompressedImageConstPtr& msg_img_right, const sensor_msgs::PointCloud2ConstPtr& msg_points)
 {
     // Get CV Image (from compressed image message)
@@ -45,6 +47,9 @@ void ImagePointSyncCallback(const sensor_msgs::CompressedImageConstPtr& msg_img_
     img_center.copyTo(lidar_to_camera_center);
     img_left.copyTo(lidar_to_camera_left);
     img_right.copyTo(lidar_to_camera_right);
+
+    // Initialize depth image (16 bit)
+    cv::Mat depth_img_center(img_center.rows, img_center.cols, CV_16UC1, cv::Scalar(255*255));
     
     // Get Pointcloud
     pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>);
@@ -74,7 +79,16 @@ void ImagePointSyncCallback(const sensor_msgs::CompressedImageConstPtr& msg_img_
         point_buf_center.z = (vec_center.at(8) * point.x + vec_center.at(9) * point.y + vec_center.at(10) * point.z + vec_center.at(11));
         point_buf_center.x *= ratio_col;
         point_buf_center.y *= ratio_row;
+        // - for camera-lidar fusion image
+        // -- circle(InputOutputArray img, Point center, int radius, Scalar color, int thickness, int lineType, int shift)
         circle(lidar_to_camera_center, cv::Point(point_buf_center.x, point_buf_center.y), 2, cv::Scalar(b, g, r), -1, 8, 0);
+        // - for depth image
+        // -- circle(InputOutputArray img, Point center, int radius, Scalar color, int thickness, int lineType, int shift)
+        circle(depth_img_center, cv::Point(point_buf_center.x, point_buf_center.y), 5, cv::Scalar(depth*255), -1, 8, 0);
+        // - save depth image
+        std::string save_path_center = "/home/usrg/calib_ws/src/camera_lidar_fusion/images/" +
+                                        std::to_string(msg_img_center->header.stamp.sec) +
+                                        std::to_string(msg_img_center->header.stamp.nsec)+".png";
 
         // for left cam + lidar
         point_buf_left.x = ((vec_left.at(0) * point.x + vec_left.at(1) * point.y + vec_left.at(2) * point.z + vec_left.at(3)) / (vec_left.at(8) * point.x + vec_left.at(9) * point.y + vec_left.at(10) * point.z + vec_left.at(11)));
