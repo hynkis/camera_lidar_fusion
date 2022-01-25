@@ -45,7 +45,9 @@ double ratio_row = TARGET_ROW / ORIGINAL_ROW;
 double ratio_col = TARGET_COL / ORIGINAL_COL;
 
 // Publisher & Subscriber
-ros::Publisher pubDWResultsBBoxArray; // detection_msgs::BoundingBoxArray
+ros::Publisher pubDWResultsBBoxArrayCenter; // detection_msgs::BoundingBoxArray
+ros::Publisher pubDWResultsBBoxArrayLeft;
+ros::Publisher pubDWResultsBBoxArrayRight;
 
 // Data structure for driveworks results
 struct PointState
@@ -70,9 +72,6 @@ Eigen::Matrix4f trans_center, trans_left, trans_right;
 std::vector<float> vec_center, vec_left, vec_right;
 
 // Variables
-int r = 0;
-int g = 0;
-int b = 0;
 cv::Mat lidar_to_camera_center, lidar_to_camera_left, lidar_to_camera_right;
 bool bGetDWResultsCenter = false;
 bool bGetDWResultsLeft = false;
@@ -118,16 +117,96 @@ detection_msgs::BoundingBox setBbox3D(double point_x, double point_y, double poi
     return bbox3D;
 }
 
+void filterPointInObjBBOX(pcl::PointXYZI fusion_point, pcl::PointXYZI point, eurecar_msgs::px2ObjDetection obj_detections,
+                          std::vector<std::vector<PointState>> &bbox_points_containers,
+                          std::vector<std::vector<double>> &bbox_depths_containers)
+{
+    // tips: '&' in &bbox_points_containers, &bbox_depths_containers for updating those variables 
+    for (int bbox_idx = 0; bbox_idx < obj_detections.bboxs.size(); bbox_idx++)
+    {
+        // Check score && bbox size && class (car, pede) [id: car(0), traffic_sign(1), bicycle(2), traffic_signal(3), Pedestrian(4)]
+        if (obj_detections.objHypotheses[bbox_idx].score > DW_SCORE_THRESHOLD &&
+            obj_detections.bboxs[bbox_idx].size_x > DW_SIZE_THRES &&
+            (obj_detections.objHypotheses[bbox_idx].id == 0 ||
+             obj_detections.objHypotheses[bbox_idx].id == 2 ||
+             obj_detections.objHypotheses[bbox_idx].id == 4))
+        {
+            // - check inside ROI of center cam
+            double pixel_xmin = obj_detections.bboxs[bbox_idx].center.x - obj_detections.bboxs[bbox_idx].size_x/2;
+            double pixel_xmax = obj_detections.bboxs[bbox_idx].center.x + obj_detections.bboxs[bbox_idx].size_x/2;
+            double pixel_ymin = obj_detections.bboxs[bbox_idx].center.y - obj_detections.bboxs[bbox_idx].size_y/2;
+            double pixel_ymax = obj_detections.bboxs[bbox_idx].center.y + obj_detections.bboxs[bbox_idx].size_y/2;
+
+            if (fusion_point.x >= pixel_xmin && fusion_point.x <= pixel_xmax &&
+                fusion_point.y >= pixel_ymin && fusion_point.y <= pixel_ymax)
+            {
+                // - compute depth
+                double depth = sqrt(pow(point.x, 2.0) + pow(point.y, 2));
+                // - gather points in each bbox container
+                PointState bbox_state;
+                bbox_state.u = fusion_point.x;
+                bbox_state.v = fusion_point.y;
+                bbox_state.w = depth;
+                bbox_state.x = point.x;
+                bbox_state.y = point.y;
+                bbox_state.z = point.z;
+                bbox_points_containers[bbox_idx].push_back(bbox_state);
+                bbox_depths_containers[bbox_idx].push_back(depth);
+            }
+        }
+    }
+}
+
+
+void estimateDepthAndAssignBBOX(std::vector<std::vector<PointState>> bbox_points_containers,
+                                std::vector<std::vector<double>> bbox_depths_containers,
+                                std::vector<PointState> &bbox_result_states,
+                                detection_msgs::BoundingBoxArray &bboxes_result_states_current)
+{
+    // tips: '&' in &bbox_result_states, &bboxes_result_states_current for updating those variables 
+    for (int bbox_idx=0; bbox_idx < bbox_depths_containers.size(); bbox_idx++)
+    {
+        // Check num of depth(point state) in each bbox
+        if (bbox_depths_containers[bbox_idx].size() == 0)
+        {
+            // TODO Do process when no lidar point in bbox
+        }
+        else
+        {
+            // - compute median index and value
+            auto median_data = median_function(bbox_depths_containers[bbox_idx]);
+            int median_index = median_data[0];
+            double median_value = median_data[1];
+
+            // - assign point state && gather bbox_result_state
+            PointState bbox_result_state;
+            bbox_result_state = bbox_points_containers[bbox_idx][median_index]; // copy median's [u,v,w,x,y,z] of each bbox 
+            bbox_result_states[bbox_idx] = bbox_result_state; 
+
+            // - assign boundingbox message
+            detection_msgs::BoundingBox bbox_result_state_msg = setBbox3D(bbox_result_state.x, bbox_result_state.y, bbox_result_state.z, bbox_idx);
+            bboxes_result_states_current.boxes.push_back(bbox_result_state_msg);
+        }
+    }
+}
+
+
 // Callback for Driveworks detection results (center/left/right)
 void callbackDWDetection(const eurecar_msgs::px2DetectionResult::ConstPtr& msg, int cam_idx)
 {
     px2ObjDetections[cam_idx - 1] = msg->obj_detection_result;
     if (cam_idx == 1)
+    {
         bGetDWResultsCenter = true;
+    }
     else if (cam_idx == 2)
+    {
         bGetDWResultsRight = true;
+    }
     else if (cam_idx == 3)
+    {
         bGetDWResultsLeft = true;
+    }
 }
 
 void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_center, const sensor_msgs::CompressedImageConstPtr& msg_img_left, const sensor_msgs::CompressedImageConstPtr& msg_img_right, const sensor_msgs::PointCloud2ConstPtr& msg_points)
@@ -166,18 +245,34 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
     // Initialize data containers
     // - initialize points container for each bbox (bbox points container)
     std::vector<std::vector<PointState>> bbox_points_containers_center; // Dimension: BBox > Points > PointState
+    std::vector<std::vector<PointState>> bbox_points_containers_left;
+    std::vector<std::vector<PointState>> bbox_points_containers_right;
     std::vector<std::vector<double>> bbox_depths_containers_center; // Dimension: BBox > Points > double
+    std::vector<std::vector<double>> bbox_depths_containers_left;
+    std::vector<std::vector<double>> bbox_depths_containers_right;
 
     // - initialize result state of bboxs (PixelX,PixelY,Depth,X,Y,Z) for center cam
     std::vector<PointState> bbox_result_states_center; // Dimension: BBox > PointState
+    std::vector<PointState> bbox_result_states_left;
+    std::vector<PointState> bbox_result_states_right;
 
     // - initialize detection bbox message (BoundingBoxArray)
     detection_msgs::BoundingBoxArray bboxes_result_states_current_center;
+    detection_msgs::BoundingBoxArray bboxes_result_states_current_left;
+    detection_msgs::BoundingBoxArray bboxes_result_states_current_right;
 
     // - resize data
     bbox_points_containers_center.resize(num_obj_det_center);
+    bbox_points_containers_left.resize(num_obj_det_left);
+    bbox_points_containers_right.resize(num_obj_det_right);
+
     bbox_depths_containers_center.resize(num_obj_det_center);
+    bbox_depths_containers_left.resize(num_obj_det_left);
+    bbox_depths_containers_right.resize(num_obj_det_right);
+
     bbox_result_states_center.resize(num_obj_det_center);
+    bbox_result_states_left.resize(num_obj_det_left);
+    bbox_result_states_right.resize(num_obj_det_right);
 
     // Iteration w.r.t. points (for Visualization of the Camera-LiDAR fusion)
     for (auto &point : cloud->points)
@@ -197,37 +292,9 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         // Gathering bbox_states_center and bbox_depths_container_center
         if (bGetDWResultsCenter)
         {
-            // px2ObjDetections[0]: Object Detection results of Center
-            for (int bbox_idx = 0; bbox_idx < px2ObjDetections[0].bboxs.size(); bbox_idx++)
-            {
-                // Check score && class (car)
-                if (px2ObjDetections[0].objHypotheses[bbox_idx].score > DW_SCORE_THRESHOLD &&
-                    px2ObjDetections[0].bboxs[bbox_idx].size_x > DW_SIZE_THRES)
-                {
-                    // - check inside ROI of center cam
-                    double pixel_xmin = px2ObjDetections[0].bboxs[bbox_idx].center.x - px2ObjDetections[0].bboxs[bbox_idx].size_x/2;
-                    double pixel_xmax = px2ObjDetections[0].bboxs[bbox_idx].center.x + px2ObjDetections[0].bboxs[bbox_idx].size_x/2;
-                    double pixel_ymin = px2ObjDetections[0].bboxs[bbox_idx].center.y - px2ObjDetections[0].bboxs[bbox_idx].size_y/2;
-                    double pixel_ymax = px2ObjDetections[0].bboxs[bbox_idx].center.y + px2ObjDetections[0].bboxs[bbox_idx].size_y/2;
-
-                    if (point_buf_center.x >= pixel_xmin && point_buf_center.x <= pixel_xmax &&
-                        point_buf_center.y >= pixel_ymin && point_buf_center.y <= pixel_ymax)
-                    {
-                        // - compute depth
-                        double depth = sqrt(pow(point.x, 2.0) + pow(point.y, 2));
-                        // - gather points in each bbox container
-                        PointState bbox_state;
-                        bbox_state.u = point_buf_center.x;
-                        bbox_state.v = point_buf_center.y;
-                        bbox_state.w = depth;
-                        bbox_state.x = point.x;
-                        bbox_state.y = point.y;
-                        bbox_state.z = point.z;
-                        bbox_points_containers_center[bbox_idx].push_back(bbox_state);
-                        bbox_depths_containers_center[bbox_idx].push_back(depth);
-                    }
-                }
-            }
+            // - check inside bbox & inside ROI of center cam
+            // - put point in points container center
+            filterPointInObjBBOX(point_buf_center, point, obj_detections_center, bbox_points_containers_center, bbox_depths_containers_center);
         }
 
         // Point Buffer (U,V,W)
@@ -242,6 +309,7 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         {
             // - check inside bbox & inside ROI of left cam
             // - put point in points container left
+            filterPointInObjBBOX(point_buf_left, point, obj_detections_left, bbox_points_containers_left, bbox_depths_containers_left);
         }
 
         // Point Buffer (U,V,W)
@@ -256,6 +324,7 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         {
             // - check inside bbox & inside ROI of right cam
             // - put point in points container right
+            filterPointInObjBBOX(point_buf_right, point, obj_detections_right, bbox_points_containers_right, bbox_depths_containers_right);
         }
 
     }
@@ -263,30 +332,30 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
     // Estimate depth using median filter for each bbox points container && assign visualization message
     if (bbox_depths_containers_center.size() != 0)
     {
-        for (int bbox_idx=0; bbox_idx < bbox_depths_containers_center.size(); bbox_idx++)
-        {
-            // Check num of depth(point state) in each bbox
-            if (bbox_depths_containers_center[bbox_idx].size() == 0)
-            {
-                // TODO Do process when no lidar point in bbox
-            }
-            else
-            {
-                // - compute median index and value
-                auto median_data = median_function(bbox_depths_containers_center[bbox_idx]);
-                int median_index = median_data[0];
-                double median_value = median_data[1];
-
-                // - assign point state && gather bbox_result_state
-                PointState bbox_result_state;
-                bbox_result_state = bbox_points_containers_center[bbox_idx][median_index]; // copy median's [u,v,w,x,y,z] of each bbox 
-                bbox_result_states_center[bbox_idx] = bbox_result_state; 
-
-                // - assign boundingbox message
-                detection_msgs::BoundingBox bbox_result_state_msg = setBbox3D(bbox_result_state.x, bbox_result_state.y, bbox_result_state.z, bbox_idx);
-                bboxes_result_states_current_center.boxes.push_back(bbox_result_state_msg);
-            }
-        }
+        // - estimate depth using median function
+        // - assign boundingbox array message
+        estimateDepthAndAssignBBOX(bbox_points_containers_center,
+                                   bbox_depths_containers_center,
+                                   bbox_result_states_center,
+                                   bboxes_result_states_current_center);
+    }
+    if (bbox_depths_containers_left.size() != 0)
+    {
+        // - estimate depth using median function
+        // - assign boundingbox array message
+        estimateDepthAndAssignBBOX(bbox_points_containers_left,
+                                   bbox_depths_containers_left,
+                                   bbox_result_states_left,
+                                   bboxes_result_states_current_left);
+    }
+    if (bbox_depths_containers_right.size() != 0)
+    {
+        // - estimate depth using median function
+        // - assign boundingbox array message
+        estimateDepthAndAssignBBOX(bbox_points_containers_right,
+                                   bbox_depths_containers_right,
+                                   bbox_result_states_right,
+                                   bboxes_result_states_current_right);
     }
 
     // Update current bbox results message
@@ -294,22 +363,32 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
     bboxes_result_states_center.header.frame_id = "velodyne";
     bboxes_result_states_center.header.stamp = ros::Time::now();
 
+    bboxes_result_states_left = bboxes_result_states_current_left;
+    bboxes_result_states_left.header.frame_id = "velodyne";
+    bboxes_result_states_left.header.stamp = ros::Time::now();
+
+    bboxes_result_states_right = bboxes_result_states_current_right;
+    bboxes_result_states_right.header.frame_id = "velodyne";
+    bboxes_result_states_right.header.stamp = ros::Time::now();
+
     // Publish boundingbox message
-    pubDWResultsBBoxArray.publish(bboxes_result_states_center);
+    pubDWResultsBBoxArrayCenter.publish(bboxes_result_states_center);
+    pubDWResultsBBoxArrayLeft.publish(bboxes_result_states_left);
+    pubDWResultsBBoxArrayRight.publish(bboxes_result_states_right);
 
 
-    // View visualization image
-    if (lidar_to_camera_center.empty() || lidar_to_camera_left.empty() || lidar_to_camera_right.empty())
-    {
-        std::cout << "image is empty" << std::endl;
-    }
-    else
-    {
-        cv::imshow("cam_center", lidar_to_camera_center);
-        cv::imshow("cam_left", lidar_to_camera_left);
-        cv::imshow("cam_right", lidar_to_camera_right);
-        cv::waitKey(1);
-    }
+    // // View visualization image
+    // if (lidar_to_camera_center.empty() || lidar_to_camera_left.empty() || lidar_to_camera_right.empty())
+    // {
+    //     std::cout << "image is empty" << std::endl;
+    // }
+    // else
+    // {
+    //     cv::imshow("cam_center", lidar_to_camera_center);
+    //     cv::imshow("cam_left", lidar_to_camera_left);
+    //     cv::imshow("cam_right", lidar_to_camera_right);
+    //     cv::waitKey(1);
+    // }
 }
 
 
@@ -380,7 +459,9 @@ int main(int argc, char** argv){
     sync.registerCallback(boost::bind(&callbackImagePointSync, _1, _2, _3, _4));
 
     // Publisher
-    pubDWResultsBBoxArray = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray",10);
+    pubDWResultsBBoxArrayCenter = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Center",10);
+    pubDWResultsBBoxArrayLeft = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Left",10);
+    pubDWResultsBBoxArrayRight = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Right",10);
     
     while(ros::ok())
     {
