@@ -35,24 +35,35 @@ using namespace std;
 using namespace ros;
 
 int NUM_CAMERAS = 3;
+std::string FRAME_ID = "velodyne";
 double DW_SCORE_THRESHOLD = 0.95; // threshold for driveworks detection score
 double DW_SIZE_THRES = 20; // threshold for driveworks detection size
 double ORIGINAL_ROW = 960; // 1920
 double ORIGINAL_COL = 604; // 1208
 double TARGET_ROW = 960; // 503
 double TARGET_COL = 604; // 800
-double ratio_row = TARGET_ROW / ORIGINAL_ROW;
-double ratio_col = TARGET_COL / ORIGINAL_COL;
+double RATIO_ROW = TARGET_ROW / ORIGINAL_ROW;
+double RATIO_COL = TARGET_COL / ORIGINAL_COL;
+double VEHICLE_DIM_X = 2.0; // 3.0
+double VEHICLE_DIM_Y = 2.0; // 2.0
+double VEHICLE_DIM_Z = 1.7; // 1.7
+
+int SOFT_NMS_METHOD = 3; // linear: 1 / gaussian: 2 / original NMS: else
+double SOFT_NMS_SIGMA = 0.5; // 0.5
+double SOFT_NMS_IOU_THRES = 0.05; // 0.3
+double HARD_NMS_IOU_THRES = 0.1;
+double SOFT_NMS_SCORE_THRES = DW_SCORE_THRESHOLD; // default: 0.01
 
 // Publisher & Subscriber
 ros::Publisher pubDWResultsBBoxArrayCenter; // detection_msgs::BoundingBoxArray
 ros::Publisher pubDWResultsBBoxArrayLeft;
 ros::Publisher pubDWResultsBBoxArrayRight;
+ros::Publisher pubDWResultsBBoxArrayFusion;
 
 // Data structure for driveworks results
-struct PointState
+struct DetectionState
 {
-    // uvw values in Pixel coordinates
+    // uvw values in Pixel coordinates (Center point)
     double u; // pixel_x
     double v; // pixel_y
     double w; // depth
@@ -60,12 +71,18 @@ struct PointState
     double x;
     double y;
     double z;
+    // bounding box size
+    double bbox_w;
+    double bbox_h;
+    // detection info (score, class id)
+    double score;
+    double id;
+    // camera info
+    int cam_num;
 };
 
 // Detection results msgs (Pixel coordinate)
 std::vector<eurecar_msgs::px2ObjDetection> px2ObjDetections; // [center,left,right]
-// Detection results (XY coordinate)
-std::vector<PointState> dw_results_XYZ_center;
 
 // Transformation Matrix (LiDAR to Camera)
 Eigen::Matrix4f trans_center, trans_left, trans_right;
@@ -77,11 +94,17 @@ bool bGetDWResultsCenter = false;
 bool bGetDWResultsLeft = false;
 bool bGetDWResultsRight = false;
 
-// Messages
-detection_msgs::BoundingBoxArray bboxes_result_states_center;
-detection_msgs::BoundingBoxArray bboxes_result_states_left;
-detection_msgs::BoundingBoxArray bboxes_result_states_right;
+std::vector<DetectionState> m_bbox_result_states_center;
+std::vector<DetectionState> m_bbox_result_states_left;
+std::vector<DetectionState> m_bbox_result_states_right;
 
+// Messages
+detection_msgs::BoundingBoxArray m_bbox_msg_result_states_center;
+detection_msgs::BoundingBoxArray m_bbox_msg_result_states_left;
+detection_msgs::BoundingBoxArray m_bbox_msg_result_states_right;
+detection_msgs::BoundingBoxArray bboxes_result_states_fusion;
+
+// Utils
 std::vector<double> median_function(vector<double> &v)
 {
     // Reference: https://stackoverflow.com/questions/1719070/what-is-the-right-approach-when-using-stl-container-for-median-calculation/1719155#1719155
@@ -98,15 +121,183 @@ std::vector<double> median_function(vector<double> &v)
     return output;
 }
 
+float calIOUWithNoRotation(const DetectionState& bbox1, const DetectionState& bbox2)
+{
+    // - determine (x,y) of intersection rectangle
+    float inter_tx = std::max(bbox1.u - bbox1.bbox_w/2., bbox2.u - bbox2.bbox_w/2.); // top (x,y) of inter. rect.
+    float inter_ty = std::max(bbox1.v - bbox1.bbox_h/2., bbox2.v - bbox2.bbox_h/2.);
+    float inter_bx = std::min(bbox1.u + bbox1.bbox_w/2., bbox2.u + bbox2.bbox_w/2.); // bottom (x,y) of inter. rect.
+    float inter_by = std::min(bbox1.v + bbox1.bbox_h/2., bbox2.v + bbox2.bbox_h/2.);
+    // - determine width, height of intersection rectangle
+    float inter_w = inter_bx - inter_tx + 1;
+    float inter_h = inter_by - inter_ty + 1;
+    // - no overlap
+    if (inter_w < 0 || inter_h < 0)
+    {
+        return 0.;
+    }
+    // - calculate iou
+    float inter_area = inter_w * inter_h;
+    float bbox1_area = bbox1.bbox_w * bbox1.bbox_h;
+    float bbox2_area = bbox2.bbox_w * bbox2.bbox_h;
+    float iou = inter_area / (bbox1_area + bbox2_area - inter_area + 1e-4);
+
+    return iou;
+}
+
+float calXYIOUWithNoRotation(const DetectionState& bbox1, const DetectionState& bbox2)
+{
+    // - determine (x,y) of intersection rectangle
+    float inter_tx = std::max(bbox1.x - VEHICLE_DIM_X/2., bbox2.x - VEHICLE_DIM_X/2.); // top (x,y) of inter. rect.
+    float inter_ty = std::max(bbox1.y - VEHICLE_DIM_Y/2., bbox2.y - VEHICLE_DIM_Y/2.);
+    float inter_bx = std::min(bbox1.x + VEHICLE_DIM_X/2., bbox2.x + VEHICLE_DIM_X/2.); // bottom (x,y) of inter. rect.
+    float inter_by = std::min(bbox1.y + VEHICLE_DIM_Y/2., bbox2.y + VEHICLE_DIM_Y/2.);
+    // - determine width, height of intersection rectangle
+    float inter_w = inter_bx - inter_tx + 1;
+    float inter_h = inter_by - inter_ty + 1;
+    // - no overlap
+    if (inter_w < 0 || inter_h < 0)
+    {
+        return 0.;
+    }
+    // - calculate iou
+    float inter_area = inter_w * inter_h;
+    float bbox1_area = VEHICLE_DIM_X * VEHICLE_DIM_Y;
+    float bbox2_area = VEHICLE_DIM_X * VEHICLE_DIM_Y;
+    float iou = inter_area / (bbox1_area + bbox2_area - inter_area + 1e-4);
+
+    return iou;
+}
+
+
+void IOUFilteringWithNoRotation(std::vector<DetectionState>& bboxes,
+                                const int& method, const float& sigma,
+                                const float& iou_thres,
+                                const float& iou_thres_hard,
+                                const float& score_threshold)
+{
+    // IOU Filtering
+    // : Soft Non-Maximum Suppression (Linear/Gaussian/Original) or Hard IOU filtering
+    // : if some bboxes has (iou > iou_thres), reduce confidence
+    // (reference) https://eehoeskrap.tistory.com/407 [Enough is not enough]
+
+    if (bboxes.empty())
+    {
+        return;
+    }
+    // 
+    int N = bboxes.size();
+    float max_score, max_pos, cur_pos, weight;
+    DetectionState tmp_bbox, index_bbox;
+
+    // Sort by distance
+
+    for (int i=0; i < N; ++i)
+    {
+        // Soft NMS
+        // - init values
+        max_score = bboxes[i].score;
+        max_pos = i;
+        tmp_bbox = bboxes[i];
+        cur_pos = i;
+
+        // - get max score bbox
+        while (cur_pos < N)
+        {
+            if (max_score < bboxes[cur_pos].score)
+            {
+                max_score = bboxes[cur_pos].score;
+                max_pos = cur_pos;
+            }
+            cur_pos++;
+        }
+
+        // - add max bbox as a detection
+        bboxes[i] = bboxes[max_pos];
+        // - swap i th bbox with position of max score bbox
+        bboxes[max_pos] = tmp_bbox;
+        tmp_bbox = bboxes[i];
+        cur_pos = i + 1;
+
+        // 
+        while (cur_pos < N)
+        {
+            //
+            index_bbox = bboxes[cur_pos];
+
+            float area = index_bbox.bbox_h * index_bbox.bbox_w;
+            // float iou = calIOUWithNoRotation(tmp_bbox, index_bbox);
+            float iou = calXYIOUWithNoRotation(tmp_bbox, index_bbox);
+            // - pass this bbox (no overlap)
+            if (iou <= 0)
+            {
+                cur_pos++;
+                continue; 
+            }
+            // - NMS method (linear/gaussian/original NMS)
+            // - Lineara Soft-NMS
+            if (method == 1)
+            {
+                if (iou > iou_thres)
+                    weight = 1 - iou;
+                else
+                    weight = 1;
+            }
+            // - Gaussian Soft-NMS
+            else if (method == 2)
+            {
+                weight = exp(-(iou * iou) / sigma);
+            }
+            // - Original NMS
+            else
+            {
+                if (iou > iou_thres)
+                    weight = 0;
+                else
+                    weight = 1;
+            }
+            // - apply hard iou threshold
+            if (iou > iou_thres_hard)
+            {
+                weight = 0;
+            }
+            // - apply weight at score
+            bboxes[cur_pos].score *= weight;
+
+            if (bboxes[cur_pos].score <= score_threshold)
+            {
+                bboxes[cur_pos] = bboxes[N - 1];
+                N--;
+                cur_pos = cur_pos + 1;
+            }
+            cur_pos++;
+        }
+    }
+    bboxes.resize(N);
+
+    // Remove (0,0) data
+    // - use 'remove_if'
+    // (reference) https://stackoverflow.com/questions/17270837/stdvector-removing-elements-which-fulfill-some-conditions
+    bboxes.erase(std::remove_if
+    (
+        bboxes.begin(), bboxes.end(),
+        [](const DetectionState& bbox_state)
+        {
+            return (bbox_state.x == 0 && bbox_state.y == 0); // condition
+        }
+    ), bboxes.end());
+}
+
+
 detection_msgs::BoundingBox setBbox3D(double point_x, double point_y, double point_z, int label_id)
 {
     detection_msgs::BoundingBox bbox3D;
-    bbox3D.header.frame_id = "velodyne";
+    bbox3D.header.frame_id = FRAME_ID;
     bbox3D.header.stamp = ros::Time::now();
     bbox3D.label = label_id;
-    bbox3D.dimensions.x = 3.0; // car dimensions
-    bbox3D.dimensions.y = 2.0; //
-    bbox3D.dimensions.z = 1.7; //
+    bbox3D.dimensions.x = VEHICLE_DIM_X; // 3.0 car dimensions
+    bbox3D.dimensions.y = VEHICLE_DIM_Y; // 2.0 
+    bbox3D.dimensions.z = VEHICLE_DIM_Z; // 1.7
     bbox3D.pose.position.x = point_x;
     bbox3D.pose.position.y = point_y;
     bbox3D.pose.position.z = point_z;
@@ -118,7 +309,7 @@ detection_msgs::BoundingBox setBbox3D(double point_x, double point_y, double poi
 }
 
 void filterPointInObjBBOX(pcl::PointXYZI fusion_point, pcl::PointXYZI point, eurecar_msgs::px2ObjDetection obj_detections,
-                          std::vector<std::vector<PointState>> &bbox_points_containers,
+                          std::vector<std::vector<DetectionState>> &bbox_points_containers,
                           std::vector<std::vector<double>> &bbox_depths_containers)
 {
     // tips: '&' in &bbox_points_containers, &bbox_depths_containers for updating those variables 
@@ -142,14 +333,15 @@ void filterPointInObjBBOX(pcl::PointXYZI fusion_point, pcl::PointXYZI point, eur
             {
                 // - compute depth
                 double depth = sqrt(pow(point.x, 2.0) + pow(point.y, 2));
-                // - gather points in each bbox container
-                PointState bbox_state;
+                // - gather states in each bbox container
+                DetectionState bbox_state;
                 bbox_state.u = fusion_point.x;
                 bbox_state.v = fusion_point.y;
                 bbox_state.w = depth;
                 bbox_state.x = point.x;
                 bbox_state.y = point.y;
                 bbox_state.z = point.z;
+
                 bbox_points_containers[bbox_idx].push_back(bbox_state);
                 bbox_depths_containers[bbox_idx].push_back(depth);
             }
@@ -158,12 +350,13 @@ void filterPointInObjBBOX(pcl::PointXYZI fusion_point, pcl::PointXYZI point, eur
 }
 
 
-void estimateDepthAndAssignBBOX(std::vector<std::vector<PointState>> bbox_points_containers,
+void estimateDepthAndAssignBBOX(std::vector<std::vector<DetectionState>> bbox_points_containers,
                                 std::vector<std::vector<double>> bbox_depths_containers,
-                                std::vector<PointState> &bbox_result_states,
-                                detection_msgs::BoundingBoxArray &bboxes_result_states_current)
+                                std::vector<DetectionState> &bbox_result_states,
+                                eurecar_msgs::px2ObjDetection obj_detections,
+                                detection_msgs::BoundingBoxArray &bbox_msg_result_states)
 {
-    // tips: '&' in &bbox_result_states, &bboxes_result_states_current for updating those variables 
+    // tips: '&' in &bbox_result_states, &bbox_msg_result_states for updating those variables 
     for (int bbox_idx=0; bbox_idx < bbox_depths_containers.size(); bbox_idx++)
     {
         // Check num of depth(point state) in each bbox
@@ -179,17 +372,42 @@ void estimateDepthAndAssignBBOX(std::vector<std::vector<PointState>> bbox_points
             double median_value = median_data[1];
 
             // - assign point state && gather bbox_result_state
-            PointState bbox_result_state;
-            bbox_result_state = bbox_points_containers[bbox_idx][median_index]; // copy median's [u,v,w,x,y,z] of each bbox 
+            DetectionState bbox_result_state;
+            bbox_result_state = bbox_points_containers[bbox_idx][median_index]; // copy median's [u,v,w,x,y,z] of each bbox
+            
+            bbox_result_state.bbox_w = obj_detections.bboxs[bbox_idx].size_x; // copy info of current bbox
+            bbox_result_state.bbox_h = obj_detections.bboxs[bbox_idx].size_y;
+            bbox_result_state.score = obj_detections.objHypotheses[bbox_idx].score;
+            bbox_result_state.id = obj_detections.objHypotheses[bbox_idx].id;
+            
             bbox_result_states[bbox_idx] = bbox_result_state; 
 
             // - assign boundingbox message
             detection_msgs::BoundingBox bbox_result_state_msg = setBbox3D(bbox_result_state.x, bbox_result_state.y, bbox_result_state.z, bbox_idx);
-            bboxes_result_states_current.boxes.push_back(bbox_result_state_msg);
+            bbox_msg_result_states.boxes.push_back(bbox_result_state_msg);
         }
     }
 }
 
+void boxFusion(std::vector<DetectionState> &bbox_result_states_center,
+               std::vector<DetectionState> &bbox_result_states_left,
+               std::vector<DetectionState> &bbox_result_states_right,
+               std::vector<DetectionState> &bbox_result_states_fusion)
+{
+    // Box Fusion using Soft Non-Maximum Suppression (Soft NMS)
+    // - concatenate bbox results (center/left/right)
+    bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
+                                     std::make_move_iterator(bbox_result_states_center.begin()),
+                                     std::make_move_iterator(bbox_result_states_center.end()));
+    bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
+                                     std::make_move_iterator(bbox_result_states_left.begin()),
+                                     std::make_move_iterator(bbox_result_states_left.end()));
+    bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
+                                     std::make_move_iterator(bbox_result_states_right.begin()),
+                                     std::make_move_iterator(bbox_result_states_right.end()));
+    // - box fusion using Soft-NMS
+    IOUFilteringWithNoRotation(bbox_result_states_fusion, SOFT_NMS_METHOD, SOFT_NMS_SIGMA, SOFT_NMS_IOU_THRES, HARD_NMS_IOU_THRES, SOFT_NMS_SCORE_THRES);
+}
 
 // Callback for Driveworks detection results (center/left/right)
 void callbackDWDetection(const eurecar_msgs::px2DetectionResult::ConstPtr& msg, int cam_idx)
@@ -244,22 +462,22 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
 
     // Initialize data containers
     // - initialize points container for each bbox (bbox points container)
-    std::vector<std::vector<PointState>> bbox_points_containers_center; // Dimension: BBox > Points > PointState
-    std::vector<std::vector<PointState>> bbox_points_containers_left;
-    std::vector<std::vector<PointState>> bbox_points_containers_right;
+    std::vector<std::vector<DetectionState>> bbox_points_containers_center; // Dimension: BBox > Points > DetectionState
+    std::vector<std::vector<DetectionState>> bbox_points_containers_left;
+    std::vector<std::vector<DetectionState>> bbox_points_containers_right;
     std::vector<std::vector<double>> bbox_depths_containers_center; // Dimension: BBox > Points > double
     std::vector<std::vector<double>> bbox_depths_containers_left;
     std::vector<std::vector<double>> bbox_depths_containers_right;
 
     // - initialize result state of bboxs (PixelX,PixelY,Depth,X,Y,Z) for center cam
-    std::vector<PointState> bbox_result_states_center; // Dimension: BBox > PointState
-    std::vector<PointState> bbox_result_states_left;
-    std::vector<PointState> bbox_result_states_right;
+    std::vector<DetectionState> bbox_result_states_center; // Dimension: BBox > DetectionState
+    std::vector<DetectionState> bbox_result_states_left;
+    std::vector<DetectionState> bbox_result_states_right;
 
     // - initialize detection bbox message (BoundingBoxArray)
-    detection_msgs::BoundingBoxArray bboxes_result_states_current_center;
-    detection_msgs::BoundingBoxArray bboxes_result_states_current_left;
-    detection_msgs::BoundingBoxArray bboxes_result_states_current_right;
+    detection_msgs::BoundingBoxArray bbox_msg_result_states_center;
+    detection_msgs::BoundingBoxArray bbox_msg_result_states_left;
+    detection_msgs::BoundingBoxArray bbox_msg_result_states_right;
 
     // - resize data
     bbox_points_containers_center.resize(num_obj_det_center);
@@ -284,8 +502,8 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         point_buf_center.x = ((vec_center.at(0) * point.x + vec_center.at(1) * point.y + vec_center.at(2) * point.z + vec_center.at(3)) / (vec_center.at(8) * point.x + vec_center.at(9) * point.y + vec_center.at(10) * point.z + vec_center.at(11)));
         point_buf_center.y = ((vec_center.at(4) * point.x + vec_center.at(5) * point.y + vec_center.at(6) * point.z + vec_center.at(7)) / (vec_center.at(8) * point.x + vec_center.at(9) * point.y + vec_center.at(10) * point.z + vec_center.at(11)));
         point_buf_center.z = (vec_center.at(8) * point.x + vec_center.at(9) * point.y + vec_center.at(10) * point.z + vec_center.at(11));
-        point_buf_center.x *= ratio_col;
-        point_buf_center.y *= ratio_row;
+        point_buf_center.x *= RATIO_COL;
+        point_buf_center.y *= RATIO_ROW;
         // // - for lidar-camera fusion visualization
         // circle(lidar_to_camera_center, cv::Point(point_buf_center.x, point_buf_center.y), 2, cv::Scalar(b, g, r), -1, 8, 0);
 
@@ -302,8 +520,8 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         point_buf_left.x = ((vec_left.at(0) * point.x + vec_left.at(1) * point.y + vec_left.at(2) * point.z + vec_left.at(3)) / (vec_left.at(8) * point.x + vec_left.at(9) * point.y + vec_left.at(10) * point.z + vec_left.at(11)));
         point_buf_left.y = ((vec_left.at(4) * point.x + vec_left.at(5) * point.y + vec_left.at(6) * point.z + vec_left.at(7)) / (vec_left.at(8) * point.x + vec_left.at(9) * point.y + vec_left.at(10) * point.z + vec_left.at(11)));
         point_buf_left.z = (vec_left.at(8) * point.x + vec_left.at(9) * point.y + vec_left.at(10) * point.z + vec_left.at(11));
-        point_buf_left.x *= ratio_col;
-        point_buf_left.y *= ratio_row;
+        point_buf_left.x *= RATIO_COL;
+        point_buf_left.y *= RATIO_ROW;
 
         if (bGetDWResultsLeft)
         {
@@ -317,8 +535,8 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         point_buf_right.x = ((vec_right.at(0) * point.x + vec_right.at(1) * point.y + vec_right.at(2) * point.z + vec_right.at(3)) / (vec_right.at(8) * point.x + vec_right.at(9) * point.y + vec_right.at(10) * point.z + vec_right.at(11)));
         point_buf_right.y = ((vec_right.at(4) * point.x + vec_right.at(5) * point.y + vec_right.at(6) * point.z + vec_right.at(7)) / (vec_right.at(8) * point.x + vec_right.at(9) * point.y + vec_right.at(10) * point.z + vec_right.at(11)));
         point_buf_right.z = (vec_right.at(8) * point.x + vec_right.at(9) * point.y + vec_right.at(10) * point.z + vec_right.at(11));
-        point_buf_right.x *= ratio_col;
-        point_buf_right.y *= ratio_row;
+        point_buf_right.x *= RATIO_COL;
+        point_buf_right.y *= RATIO_ROW;
 
         if (bGetDWResultsRight)
         {
@@ -337,7 +555,8 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         estimateDepthAndAssignBBOX(bbox_points_containers_center,
                                    bbox_depths_containers_center,
                                    bbox_result_states_center,
-                                   bboxes_result_states_current_center);
+                                   obj_detections_center,
+                                   bbox_msg_result_states_center);
     }
     if (bbox_depths_containers_left.size() != 0)
     {
@@ -346,7 +565,8 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         estimateDepthAndAssignBBOX(bbox_points_containers_left,
                                    bbox_depths_containers_left,
                                    bbox_result_states_left,
-                                   bboxes_result_states_current_left);
+                                   obj_detections_left,
+                                   bbox_msg_result_states_left);
     }
     if (bbox_depths_containers_right.size() != 0)
     {
@@ -355,26 +575,32 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
         estimateDepthAndAssignBBOX(bbox_points_containers_right,
                                    bbox_depths_containers_right,
                                    bbox_result_states_right,
-                                   bboxes_result_states_current_right);
+                                   obj_detections_right,
+                                   bbox_msg_result_states_right);
     }
 
-    // Update current bbox results message
-    bboxes_result_states_center = bboxes_result_states_current_center;
-    bboxes_result_states_center.header.frame_id = "velodyne";
-    bboxes_result_states_center.header.stamp = ros::Time::now();
+    // Update current detection results
+    m_bbox_result_states_center = bbox_result_states_center;
+    m_bbox_result_states_left = bbox_result_states_left;
+    m_bbox_result_states_right = bbox_result_states_right;
 
-    bboxes_result_states_left = bboxes_result_states_current_left;
-    bboxes_result_states_left.header.frame_id = "velodyne";
-    bboxes_result_states_left.header.stamp = ros::Time::now();
+    // Update bbox results message
+    m_bbox_msg_result_states_center = bbox_msg_result_states_center;
+    m_bbox_msg_result_states_center.header.frame_id = FRAME_ID;
+    m_bbox_msg_result_states_center.header.stamp = ros::Time::now();
 
-    bboxes_result_states_right = bboxes_result_states_current_right;
-    bboxes_result_states_right.header.frame_id = "velodyne";
-    bboxes_result_states_right.header.stamp = ros::Time::now();
+    m_bbox_msg_result_states_left = bbox_msg_result_states_left;
+    m_bbox_msg_result_states_left.header.frame_id = FRAME_ID;
+    m_bbox_msg_result_states_left.header.stamp = ros::Time::now();
+
+    m_bbox_msg_result_states_right = bbox_msg_result_states_right;
+    m_bbox_msg_result_states_right.header.frame_id = FRAME_ID;
+    m_bbox_msg_result_states_right.header.stamp = ros::Time::now();
 
     // Publish boundingbox message
-    pubDWResultsBBoxArrayCenter.publish(bboxes_result_states_center);
-    pubDWResultsBBoxArrayLeft.publish(bboxes_result_states_left);
-    pubDWResultsBBoxArrayRight.publish(bboxes_result_states_right);
+    pubDWResultsBBoxArrayCenter.publish(m_bbox_msg_result_states_center);
+    pubDWResultsBBoxArrayLeft.publish(m_bbox_msg_result_states_left);
+    pubDWResultsBBoxArrayRight.publish(m_bbox_msg_result_states_right);
 
 
     // // View visualization image
@@ -391,11 +617,31 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
     // }
 }
 
+void run()
+{
+    // Fuse current detection results from multi cameras
+    std::vector<DetectionState> bbox_result_states_fusion;
+    boxFusion(m_bbox_result_states_center, m_bbox_result_states_left, m_bbox_result_states_right, bbox_result_states_fusion);
+
+    // - assign bounding box array message
+    detection_msgs::BoundingBoxArray bbox_msg_result_state_fusion;
+    bbox_msg_result_state_fusion.header.frame_id = FRAME_ID;
+    bbox_msg_result_state_fusion.header.stamp = ros::Time::now();
+    std::cout << "bbox_result_states_fusion.size() : " << bbox_result_states_fusion.size() << std::endl;
+    for (auto &bbox_result_state : bbox_result_states_fusion)
+    {
+        // - assign bounding box message
+        detection_msgs::BoundingBox bbox_msg_result_state = setBbox3D(bbox_result_state.x, bbox_result_state.y, bbox_result_state.z, bbox_result_state.id);
+        bbox_msg_result_state_fusion.boxes.push_back(bbox_msg_result_state);
+    }
+    // - publish message
+    pubDWResultsBBoxArrayFusion.publish(bbox_msg_result_state_fusion);
+}
 
 int main(int argc, char** argv){
     ros::init (argc, argv, "LidarCameraCalibration");
     ros::NodeHandle nh_;
-    ros::Rate loop_rate(30);
+    ros::Rate loop_rate(30); // as fast as possible
 
     printf("Initiate: LidarCameraCalibration\n");
 
@@ -462,11 +708,16 @@ int main(int argc, char** argv){
     pubDWResultsBBoxArrayCenter = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Center",10);
     pubDWResultsBBoxArrayLeft = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Left",10);
     pubDWResultsBBoxArrayRight = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Right",10);
+    pubDWResultsBBoxArrayFusion = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray",10);
     
     while(ros::ok())
     {
-      ros::spinOnce();
-      loop_rate.sleep();
+        // Subscribe messages
+        ros::spinOnce();
+        // Run main process
+        run();
+        // Rate control
+        loop_rate.sleep();
     }
     printf("Terminate: MinCut_Segmentation\n");
 
