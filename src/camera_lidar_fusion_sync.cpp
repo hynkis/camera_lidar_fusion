@@ -34,7 +34,7 @@
 using namespace std;
 using namespace ros;
 
-int NUM_CAMERAS = 3;
+int NUM_CAMERAS = 1; //3
 std::string FRAME_ID = "velodyne";
 double DW_SCORE_THRESHOLD = 0.95; // threshold for driveworks detection score
 double DW_SIZE_THRES = 20; // threshold for driveworks detection size
@@ -399,12 +399,12 @@ void boxFusion(std::vector<DetectionState> &bbox_result_states_center,
     bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
                                      std::make_move_iterator(bbox_result_states_center.begin()),
                                      std::make_move_iterator(bbox_result_states_center.end()));
-    bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
-                                     std::make_move_iterator(bbox_result_states_left.begin()),
-                                     std::make_move_iterator(bbox_result_states_left.end()));
-    bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
-                                     std::make_move_iterator(bbox_result_states_right.begin()),
-                                     std::make_move_iterator(bbox_result_states_right.end()));
+    //bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
+    //                                 std::make_move_iterator(bbox_result_states_left.begin()),
+    //                                 std::make_move_iterator(bbox_result_states_left.end()));
+    //bbox_result_states_fusion.insert(bbox_result_states_fusion.end(),
+    //                                 std::make_move_iterator(bbox_result_states_right.begin()),
+    //                                 std::make_move_iterator(bbox_result_states_right.end()));
     // - box fusion using Soft-NMS
     IOUFilteringWithNoRotation(bbox_result_states_fusion, SOFT_NMS_METHOD, SOFT_NMS_SIGMA, SOFT_NMS_IOU_THRES, HARD_NMS_IOU_THRES, SOFT_NMS_SCORE_THRES);
 }
@@ -427,15 +427,15 @@ void callbackDWDetection(const eurecar_msgs::px2DetectionResult::ConstPtr& msg, 
     }
 }
 
-void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_center, const sensor_msgs::CompressedImageConstPtr& msg_img_left, const sensor_msgs::CompressedImageConstPtr& msg_img_right, const sensor_msgs::PointCloud2ConstPtr& msg_points)
+void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_center, const sensor_msgs::PointCloud2ConstPtr& msg_points)
 {
     // Get CV Image (from compressed image message)
     cv::Mat img_center = cv::imdecode(cv::Mat(msg_img_center->data), 1); //convert compressed image data to cv::Mat
-    cv::Mat img_left   = cv::imdecode(cv::Mat(msg_img_left->data), 1);
-    cv::Mat img_right  = cv::imdecode(cv::Mat(msg_img_right->data), 1);
+    //cv::Mat img_left   = cv::imdecode(cv::Mat(msg_img_left->data), 1);
+    //cv::Mat img_right  = cv::imdecode(cv::Mat(msg_img_right->data), 1);
     img_center.copyTo(lidar_to_camera_center);
-    img_left.copyTo(lidar_to_camera_left);
-    img_right.copyTo(lidar_to_camera_right);
+    //img_left.copyTo(lidar_to_camera_left);
+    //img_right.copyTo(lidar_to_camera_right);
 
     // Initialize depth image (16 bit)
     cv::Mat depth_img_center(img_center.rows, img_center.cols, CV_16UC1, cv::Scalar(255*255));
@@ -445,20 +445,22 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
     pcl::fromROSMsg(*msg_points, *cloud);
 
     pcl::PointCloud<pcl::PointXYZI>::Ptr ptr_transformed_center(new pcl::PointCloud<pcl::PointXYZI>);
-    pcl::PointCloud<pcl::PointXYZI>::Ptr ptr_transformed_left(new pcl::PointCloud<pcl::PointXYZI>);
-    pcl::PointCloud<pcl::PointXYZI>::Ptr ptr_transformed_right(new pcl::PointCloud<pcl::PointXYZI>);
+    // pcl::PointCloud<pcl::PointXYZI>::Ptr ptr_transformed_left(new pcl::PointCloud<pcl::PointXYZI>);
+    // pcl::PointCloud<pcl::PointXYZI>::Ptr ptr_transformed_right(new pcl::PointCloud<pcl::PointXYZI>);
 
     pcl::transformPointCloud(*cloud, *ptr_transformed_center, trans_center);
-    pcl::transformPointCloud(*cloud, *ptr_transformed_left, trans_left);
-    pcl::transformPointCloud(*cloud, *ptr_transformed_right, trans_right);
+    // pcl::transformPointCloud(*cloud, *ptr_transformed_left, trans_left);
+    // pcl::transformPointCloud(*cloud, *ptr_transformed_right, trans_right);
 
     // Get Object Detection Results
     eurecar_msgs::px2ObjDetection obj_detections_center = px2ObjDetections[0]; // cam_idx == 1
-    eurecar_msgs::px2ObjDetection obj_detections_left = px2ObjDetections[2]; // cam_idx == 3
-    eurecar_msgs::px2ObjDetection obj_detections_right = px2ObjDetections[1]; // cam_idx == 2
+    // eurecar_msgs::px2ObjDetection obj_detections_left = px2ObjDetections[2]; // cam_idx == 3
+    // eurecar_msgs::px2ObjDetection obj_detections_right = px2ObjDetections[1]; // cam_idx == 2
     int num_obj_det_center = obj_detections_center.bboxs.size();
-    int num_obj_det_left = obj_detections_left.bboxs.size();
-    int num_obj_det_right = obj_detections_right.bboxs.size();
+    // int num_obj_det_left = obj_detections_left.bboxs.size();
+    // int num_obj_det_right = obj_detections_right.bboxs.size();
+    int num_obj_det_left = 0;
+    int num_obj_det_right = 0;
 
     // Initialize data containers
     // - initialize points container for each bbox (bbox points container)
@@ -525,9 +527,9 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
 
         if (bGetDWResultsLeft)
         {
-            // - check inside bbox & inside ROI of left cam
-            // - put point in points container left
-            filterPointInObjBBOX(point_buf_left, point, obj_detections_left, bbox_points_containers_left, bbox_depths_containers_left);
+            // // - check inside bbox & inside ROI of left cam
+            // // - put point in points container left
+            // filterPointInObjBBOX(point_buf_left, point, obj_detections_left, bbox_points_containers_left, bbox_depths_containers_left);
         }
 
         // Point Buffer (U,V,W)
@@ -540,9 +542,9 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
 
         if (bGetDWResultsRight)
         {
-            // - check inside bbox & inside ROI of right cam
-            // - put point in points container right
-            filterPointInObjBBOX(point_buf_right, point, obj_detections_right, bbox_points_containers_right, bbox_depths_containers_right);
+            // // - check inside bbox & inside ROI of right cam
+            // // - put point in points container right
+            // filterPointInObjBBOX(point_buf_right, point, obj_detections_right, bbox_points_containers_right, bbox_depths_containers_right);
         }
 
     }
@@ -560,23 +562,23 @@ void callbackImagePointSync(const sensor_msgs::CompressedImageConstPtr& msg_img_
     }
     if (bbox_depths_containers_left.size() != 0)
     {
-        // - estimate depth using median function
-        // - assign boundingbox array message
-        estimateDepthAndAssignBBOX(bbox_points_containers_left,
-                                   bbox_depths_containers_left,
-                                   bbox_result_states_left,
-                                   obj_detections_left,
-                                   bbox_msg_result_states_left);
+        // // - estimate depth using median function
+        // // - assign boundingbox array message
+        // estimateDepthAndAssignBBOX(bbox_points_containers_left,
+        //                            bbox_depths_containers_left,
+        //                            bbox_result_states_left,
+        //                            obj_detections_left,
+        //                            bbox_msg_result_states_left);
     }
     if (bbox_depths_containers_right.size() != 0)
     {
-        // - estimate depth using median function
-        // - assign boundingbox array message
-        estimateDepthAndAssignBBOX(bbox_points_containers_right,
-                                   bbox_depths_containers_right,
-                                   bbox_result_states_right,
-                                   obj_detections_right,
-                                   bbox_msg_result_states_right);
+        // // - estimate depth using median function
+        // // - assign boundingbox array message
+        // estimateDepthAndAssignBBOX(bbox_points_containers_right,
+        //                            bbox_depths_containers_right,
+        //                            bbox_result_states_right,
+        //                            obj_detections_right,
+        //                            bbox_msg_result_states_right);
     }
 
     // Update current detection results
@@ -695,14 +697,17 @@ int main(int argc, char** argv){
 
     // Subscriber (Synchronous)
     message_filters::Subscriber<sensor_msgs::CompressedImage> sub_compressed_image_center(nh_, "/gmsl_camera1/compressed", 1);
-    message_filters::Subscriber<sensor_msgs::CompressedImage> sub_compressed_image_left(nh_, "/gmsl_camera3/compressed", 1);
-    message_filters::Subscriber<sensor_msgs::CompressedImage> sub_compressed_image_right(nh_, "/gmsl_camera2/compressed", 1);
+    // message_filters::Subscriber<sensor_msgs::CompressedImage> sub_compressed_image_left(nh_, "/gmsl_camera3/compressed", 1);
+    // message_filters::Subscriber<sensor_msgs::CompressedImage> sub_compressed_image_right(nh_, "/gmsl_camera2/compressed", 1);
     message_filters::Subscriber<sensor_msgs::PointCloud2> sub_point_cloud(nh_, "/velodyne_points", 1);
 
     // for synchronized message subscribtion
-    typedef message_filters::sync_policies::ApproximateTime <sensor_msgs::CompressedImage, sensor_msgs::CompressedImage, sensor_msgs::CompressedImage, sensor_msgs::PointCloud2> MySyncPolicy;
-    message_filters::Synchronizer <MySyncPolicy> sync(MySyncPolicy(10), sub_compressed_image_center, sub_compressed_image_left, sub_compressed_image_right, sub_point_cloud);
-    sync.registerCallback(boost::bind(&callbackImagePointSync, _1, _2, _3, _4));
+    //typedef message_filters::sync_policies::ApproximateTime <sensor_msgs::CompressedImage, sensor_msgs::CompressedImage, sensor_msgs::CompressedImage, sensor_msgs::PointCloud2> MySyncPolicy;
+    typedef message_filters::sync_policies::ApproximateTime <sensor_msgs::CompressedImage, sensor_msgs::PointCloud2> MySyncPolicy;
+    //message_filters::Synchronizer <MySyncPolicy> sync(MySyncPolicy(10), sub_compressed_image_center, sub_compressed_image_left, sub_compressed_image_right, sub_point_cloud);
+    message_filters::Synchronizer <MySyncPolicy> sync(MySyncPolicy(10), sub_compressed_image_center, sub_point_cloud);
+    //sync.registerCallback(boost::bind(&callbackImagePointSync, _1, _2, _3, _4));
+    sync.registerCallback(boost::bind(&callbackImagePointSync, _1, _2));
 
     // Publisher
     pubDWResultsBBoxArrayCenter = nh_.advertise<detection_msgs::BoundingBoxArray>("/Fusion/BoundingBoxArray/Center",10);
